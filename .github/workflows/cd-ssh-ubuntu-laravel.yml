@@ -1,0 +1,108 @@
+name: Deploy Laravel (SSH) Ubuntu
+
+on:
+  push:
+    branches: ["main"]
+
+jobs:
+  build-and-deploy:
+    # IMPORTANT: en local (192.168.x.x), il faut un runner self-hosted.
+    # Si tu déploies vers un VPS/public, remplace par: ubuntu-latest
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: mbstring, pdo, pdo_mysql, openssl
+          tools: composer:v2
+
+      - name: Install Composer Dependencies (prod)
+        run: composer install --no-dev --prefer-dist --optimize-autoloader --no-interaction
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Build front assets
+        run: |
+          npm ci
+          npm run build
+
+      - name: Create artifact (release.tar.gz)
+        run: |
+          tar --exclude='.git' \
+              --exclude='node_modules' \
+              --exclude='storage' \
+              --exclude='vendor' \
+              -czf release.tar.gz .
+
+      - name: Setup SSH
+        shell: bash
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "${{ secrets.DEPLOY_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          echo "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Upload artifact to server (staging)
+        shell: bash
+        run: |
+          ssh -p "${{ secrets.DEPLOY_PORT }}" "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" "mkdir -p /var/www/mon-laravel-staging"
+          scp -P "${{ secrets.DEPLOY_PORT }}" release.tar.gz "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/var/www/mon-laravel-staging/release.tar.gz"
+
+      - name: Remote deploy on Ubuntu (staging -> live)
+        shell: bash
+        run: |
+          ssh -p "${{ secrets.DEPLOY_PORT }}" "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" << 'EOF'
+            set -e
+
+            STAGING="/var/www/mon-laravel-staging"
+            LIVE="/var/www/mon-laravel-live"
+            SHARED="/var/www/mon-laravel-shared"
+
+            mkdir -p "$STAGING" "$LIVE" "$SHARED"
+
+            # Déployer dans staging
+            rm -rf "$STAGING/app"
+            mkdir -p "$STAGING/app"
+            tar -xzf "$STAGING/release.tar.gz" -C "$STAGING/app"
+
+            # Lier .env + storage persistants (recommandé)
+            if [ ! -f "$SHARED/.env" ]; then
+              echo "⚠️  $SHARED/.env manquant. Crée-le avant de déployer en prod."
+            else
+              ln -sfn "$SHARED/.env" "$STAGING/app/.env"
+            fi
+
+            mkdir -p "$SHARED/storage" "$SHARED/bootstrap/cache"
+            rm -rf "$STAGING/app/storage" "$STAGING/app/bootstrap/cache"
+            ln -sfn "$SHARED/storage" "$STAGING/app/storage"
+            ln -sfn "$SHARED/bootstrap/cache" "$STAGING/app/bootstrap/cache"
+
+            # Installer vendor côté serveur (si tu veux éviter d'envoyer vendor)
+            cd "$STAGING/app"
+            composer install --no-dev --prefer-dist --optimize-autoloader --no-interaction
+
+            # Laravel caches + migrations
+            php artisan migrate --force
+            php artisan config:cache
+            php artisan route:cache
+            php artisan view:cache
+
+            # Switch live (atomique)
+            rm -rf "$LIVE"
+            mv "$STAGING/app" "$LIVE"
+
+            # Redémarrage services si besoin (optionnel)
+            sudo systemctl reload nginx || true
+            sudo systemctl restart php8.3-fpm || true
+          EOF
